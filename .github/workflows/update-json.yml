@@ -1,7 +1,7 @@
-name: Update currency JSON hourly
+name: Update currency JSON every 12h
 on:
   schedule:
-    - cron: "5 * * * *" # once per hour at :05
+    - cron: "0 */12 * * *"   # every 12 hours (UTC)
   workflow_dispatch:
 
 permissions:
@@ -13,23 +13,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch latest rates
+      - name: Fetch latest rates from exchangeratesapi.io
         env:
           API_KEY: ${{ secrets.FREECURRENCYAPI_KEY }}
         run: |
           python3 - <<'PY'
-          import json, os, sys, urllib.request
+          import json, os, sys, urllib.request, time
+
           api_key = os.environ["API_KEY"]
-          url = f"https://api.freecurrencyapi.com/v1/latest?apikey={api_key}"
-          with urllib.request.urlopen(url) as r:
-              payload = json.load(r)
-          # payload looks like: {"data": { "AED": 3.67, ... }}
-          # You can transform if needed; here we keep as-is but add a timestamp:
-          from time import time
-          payload["updated_at_unix"] = int(time())
-          open("data.json", "w", encoding="utf-8").write(
-              json.dumps(payload, ensure_ascii=False, indent=2)
-          )
+          url = f"https://api.exchangeratesapi.io/v1/latest?access_key={api_key}&base=USD"
+
+          try:
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  src = json.load(r)
+          except Exception as e:
+              print("ERROR: failed to fetch API:", e, file=sys.stderr)
+              sys.exit(1)
+
+          if not src.get("success") or "rates" not in src:
+              print("ERROR: API returned non-success or missing rates", file=sys.stderr)
+              print(json.dumps(src, indent=2))
+              sys.exit(1)
+
+          # Convert to target format
+          out = {
+              "data": src["rates"],
+              "updated_at_unix": int(src.get("timestamp", int(time.time())))
+          }
+
+          with open("data.json", "w", encoding="utf-8") as f:
+              json.dump(out, f, ensure_ascii=False, indent=2)
           PY
 
       - name: Commit & push if changed
