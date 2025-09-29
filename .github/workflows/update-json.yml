@@ -1,4 +1,5 @@
 name: Update currency JSON every 12h
+
 on:
   schedule:
     - cron: "0 */12 * * *"   # every 12 hours (UTC)
@@ -10,37 +11,74 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Fetch latest rates from exchangeratesapi.io
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Fetch latest rates from exchangeratesapi.io (EUR→USD conversion + raw log)
         env:
-          API_KEY: ${{ secrets.FREECURRENCYAPI_KEY }}
+          API_KEY: ${{ secrets.FREECURRENCYAPI_KEY }}  # set this secret in repo settings
         run: |
           python3 - <<'PY'
-          import json, os, sys, urllib.request, time
+          import json, os, sys, time
+          from urllib.request import urlopen, Request
+          from urllib.error import HTTPError, URLError
 
           api_key = os.environ["API_KEY"]
-          url = f"https://api.exchangeratesapi.io/v1/latest?access_key={api_key}&base=USD"
+          # NOTE: omit base=USD (often not allowed on free plans -> 400)
+          url = f"https://api.exchangeratesapi.io/v1/latest?access_key={api_key}"
 
+          # --- fetch ---
           try:
-              with urllib.request.urlopen(url, timeout=30) as r:
-                  src = json.load(r)
+              req = Request(url, headers={"User-Agent": "github-actions-bot"})
+              with urlopen(req, timeout=30) as r:
+                  src = json.load(r)  # raw provider response
+          except HTTPError as e:
+              try:
+                  err_body = e.read().decode("utf-8", "ignore")
+              except Exception:
+                  err_body = "<no body>"
+              print("ERROR: HTTP", e.code, err_body, file=sys.stderr)
+              sys.exit(1)
+          except URLError as e:
+              print("ERROR: URL error:", e, file=sys.stderr)
+              sys.exit(1)
           except Exception as e:
-              print("ERROR: failed to fetch API:", e, file=sys.stderr)
+              print("ERROR: fetch failed:", e, file=sys.stderr)
               sys.exit(1)
 
+          # --- log raw response for debugging ---
+          print("=== Raw API response (exchangeratesapi.io) ===")
+          print(json.dumps(src, indent=2))
+          print("=============================================")
+
+          # --- validate & convert (EUR-based -> USD-based) ---
           if not src.get("success") or "rates" not in src:
-              print("ERROR: API returned non-success or missing rates", file=sys.stderr)
-              print(json.dumps(src, indent=2))
+              print("ERROR: API non-success or missing 'rates':", json.dumps(src, indent=2), file=sys.stderr)
               sys.exit(1)
 
-          # Convert to target format
+          rates_eur = src["rates"]  # EUR-based rates
+          if "USD" not in rates_eur or not rates_eur["USD"]:
+              print("ERROR: 'USD' missing in rates; cannot convert to USD base.", file=sys.stderr)
+              sys.exit(1)
+
+          usd_rate = float(rates_eur["USD"])  # EUR->USD
+          data_usd = {}
+          for cur, rate in rates_eur.items():
+              try:
+                  data_usd[cur] = float(rate) / usd_rate   # USD-based rate
+              except Exception:
+                  # skip any bad entries
+                  continue
+          data_usd["USD"] = 1.0  # enforce exact USD=1
+
           out = {
-              "data": src["rates"],
+              "data": data_usd,
               "updated_at_unix": int(src.get("timestamp", int(time.time())))
           }
 
+          # --- write target file ---
           with open("data.json", "w", encoding="utf-8") as f:
               json.dump(out, f, ensure_ascii=False, indent=2)
           PY
